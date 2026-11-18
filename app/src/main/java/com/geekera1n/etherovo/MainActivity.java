@@ -131,3 +131,581 @@ public class MainActivity extends AppCompatActivity {
         if (RootUtil.isRootAvailable()) {
             btnAddIp.setOnClickListener(v -> showAddIpDialog());
             btnAddRoute.setOnClickListener(v -> showAddRouteDialog());
+            btnResetInterface.setOnClickListener(v -> resetInterface());
+            lvIpAddresses.setOnItemLongClickListener((parent, view, position, id) -> {
+                String fullIp = ipList.get(position).value;
+                // +++ FIX 1: 弹窗前设标志，暂停自动刷新
+                isDialogShowing = true;
+                showDeleteConfirmationDialog(getString(R.string.item_type_ip), fullIp, () -> deleteIpAddress(fullIp));
+                return true;
+            });
+            lvRoutes.setOnItemLongClickListener((parent, view, position, id) -> {
+                String fullRoute = routeList.get(position).originalValue != null ? routeList.get(position).originalValue : routeList.get(position).value;
+                isDialogShowing = true;
+                showDeleteConfirmationDialog(getString(R.string.item_type_route), fullRoute, () -> deleteRoute(fullRoute));
+                return true;
+            });
+        }
+    }
+
+    // +++ FIX 1: 弹窗关闭后恢复刷新
+    private void onDialogDismissed() {
+        isDialogShowing = false;
+    }
+
+    private void updateUiState(boolean isConnected) {
+        if (isConnected) {
+            layoutConnected.setVisibility(View.VISIBLE);
+            layoutDisconnected.setVisibility(View.GONE);
+            findViewById(R.id.ip_section_title).setVisibility(View.VISIBLE);
+            findViewById(R.id.route_section_title).setVisibility(View.VISIBLE);
+            lvIpAddresses.setVisibility(View.VISIBLE);
+            lvRoutes.setVisibility(View.VISIBLE);
+            boolean hasRoot = RootUtil.isRootAvailable();
+            int visibility = hasRoot ? View.VISIBLE : View.GONE;
+            btnAddIp.setVisibility(visibility);
+            btnAddRoute.setVisibility(visibility);
+            btnResetInterface.setVisibility(visibility);
+            if (!hasRoot) {
+                lvIpAddresses.setOnItemLongClickListener(null);
+                lvRoutes.setOnItemLongClickListener(null);
+            }
+        } else {
+            layoutConnected.setVisibility(View.GONE);
+            layoutDisconnected.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void refreshAllInfo(boolean showToast) {
+        if (showToast) {
+            Toast.makeText(this, getString(R.string.refreshing), Toast.LENGTH_SHORT).show();
+        }
+        if (RootUtil.isRootAvailable()) {
+            refreshInfoWithRoot(showToast);
+        } else {
+            refreshInfoWithAndroidApi(showToast);
+        }
+    }
+
+    private void refreshInfoWithAndroidApi(boolean showToast) {
+        executorService.execute(() -> {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            Network activeNetwork = null;
+            for (Network network : cm.getAllNetworks()) {
+                NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                    activeNetwork = network;
+                    break;
+                }
+            }
+
+            if (activeNetwork == null) {
+                mainHandler.post(() -> {
+                    if (tvDisconnectedStatus != null) tvDisconnectedStatus.setText(getString(R.string.no_wired_connection));
+                    updateUiState(false);
+                    if (showToast) Toast.makeText(this, getString(R.string.ethernet_not_found), Toast.LENGTH_SHORT).show();
+                });
+                return;
+            }
+
+            LinkProperties linkProperties = cm.getLinkProperties(activeNetwork);
+            if (linkProperties == null) {
+                mainHandler.post(() -> updateUiState(false));
+                return;
+            }
+
+            final String interfaceName = linkProperties.getInterfaceName();
+            final List<InfoItem> newDetailsList = new ArrayList<>();
+            final List<InfoItem> newIpList = new ArrayList<>();
+            final List<InfoItem> newRouteList = new ArrayList<>();
+
+            for (LinkAddress addr : linkProperties.getLinkAddresses()) {
+                if (addr.getAddress() instanceof Inet4Address) {
+                    newIpList.add(new InfoItem(getString(R.string.ipv4_address), addr.toString()));
+                }
+            }
+
+            linkProperties.getRoutes().forEach(route -> {
+                if (route.hasGateway()) {
+                    String title = route.isDefaultRoute() ? getString(R.string.default_route_gateway) : getString(R.string.route_to, route.getDestination().toString());
+                    newRouteList.add(new InfoItem(title, route.toString()));
+                }
+            });
+
+            StringBuilder dnsBuilder = new StringBuilder();
+            for (InetAddress dns : linkProperties.getDnsServers()) {
+                dnsBuilder.append(dns.getHostAddress()).append("\n");
+            }
+
+            String macAddress = "N/A";
+            try {
+                List<NetworkInterface> all = Collections.list(NetworkInterface.getNetworkInterfaces());
+                for (NetworkInterface nif : all) {
+                    if (!nif.getName().equalsIgnoreCase(interfaceName)) continue;
+                    byte[] macBytes = nif.getHardwareAddress();
+                    if (macBytes == null) continue;
+                    StringBuilder res1 = new StringBuilder();
+                    for (byte b : macBytes) res1.append(String.format("%02X:", b));
+                    if (res1.length() > 0) res1.deleteCharAt(res1.length() - 1);
+                    macAddress = res1.toString();
+                    break;
+                }
+            } catch (Exception ex) { ex.printStackTrace(); }
+
+            newDetailsList.add(new InfoItem(getString(R.string.mac_address), macAddress));
+            newDetailsList.add(new InfoItem(getString(R.string.status), "UP"));
+            if (dnsBuilder.length() > 0) newDetailsList.add(new InfoItem(getString(R.string.dns_servers), dnsBuilder.toString().trim()));
+            newDetailsList.add(new InfoItem(getString(R.string.speed), getString(R.string.na_non_root)));
+            newDetailsList.add(new InfoItem(getString(R.string.duplex_mode), getString(R.string.na_non_root)));
+
+            mainHandler.post(() -> {
+                updateUiState(true);
+                tvInterfaceName.setText(interfaceName);
+                updateListView(detailsList, newDetailsList, detailsAdapter, lvInterfaceDetails);
+                updateListView(ipList, newIpList, ipAdapter, lvIpAddresses);
+                updateListView(routeList, newRouteList, routeAdapter, lvRoutes);
+                if (showToast) Toast.makeText(this, getString(R.string.refresh_complete), Toast.LENGTH_SHORT).show();
+            });
+        });
+    }
+
+    private void refreshInfoWithRoot(boolean showToast) {
+        executorService.execute(() -> {
+            RootUtil.CommandResult resultLinks = RootUtil.executeRootCommand("ip link show");
+            Pattern interfacePattern = Pattern.compile("\\d+: (eth\\d+|usb\\d+):");
+            Matcher interfaceMatcher = interfacePattern.matcher(resultLinks.stdout);
+            String foundInterfaceName = interfaceMatcher.find() ? interfaceMatcher.group(1) : "";
+
+            if (foundInterfaceName.isEmpty()) {
+                mainHandler.post(() -> {
+                    if (tvDisconnectedStatus != null) tvDisconnectedStatus.setText(getString(R.string.usb_not_found));
+                    this.currentInterfaceName = "";
+                    this.wasInterfaceUp = false;
+                    updateUiState(false);
+                    if (showToast) Toast.makeText(this, getString(R.string.usb_not_found), Toast.LENGTH_SHORT).show();
+                });
+                return;
+            }
+
+            final boolean isNewInterfaceConnected = !foundInterfaceName.equals(this.currentInterfaceName);
+            RootUtil.CommandResult resultLink = RootUtil.executeRootCommand("ip link show " + foundInterfaceName);
+            String linkOutput = resultLink.stdout;
+            boolean isUp = linkOutput.contains("state UP");
+
+            final boolean shouldRestoreConfig = isNewInterfaceConnected || (!this.wasInterfaceUp && isUp);
+            if (shouldRestoreConfig) {
+                applyPersistentConfig(foundInterfaceName);
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                resultLink = RootUtil.executeRootCommand("ip link show " + foundInterfaceName);
+                linkOutput = resultLink.stdout;
+                isUp = linkOutput.contains("state UP");
+            }
+
+            StringBuilder dnsBuilder = new StringBuilder();
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            for (Network network : cm.getAllNetworks()) {
+                LinkProperties linkProperties = cm.getLinkProperties(network);
+                if (linkProperties != null && foundInterfaceName.equals(linkProperties.getInterfaceName())) {
+                    for (InetAddress dns : linkProperties.getDnsServers()) {
+                        dnsBuilder.append(dns.getHostAddress()).append("\n");
+                    }
+                    break;
+                }
+            }
+
+            String macAddress = "N/A";
+            Pattern macPattern = Pattern.compile("link/ether ([0-9a-fA-F:]+)");
+            Matcher macMatcher = macPattern.matcher(linkOutput);
+            if (macMatcher.find()) macAddress = macMatcher.group(1);
+
+            RootUtil.CommandResult resultAddr = RootUtil.executeRootCommand("ip addr show " + foundInterfaceName);
+            final List<InfoItem> newIpList = new ArrayList<>();
+            Pattern ipPattern = Pattern.compile("inet (\\d+\\.\\d+\\.\\d+\\.\\d+/\\d+)");
+            Matcher ipMatcher = ipPattern.matcher(resultAddr.stdout);
+            Set<String> persistentIps = sharedPreferences.getStringSet(KEY_PERSISTENT_IPS, new HashSet<>());
+            while (ipMatcher.find()) {
+                String ipStr = ipMatcher.group(1);
+                // +++ FIX 2: 标记系统 DHCP 地址
+                boolean isManual = false;
+                for (String saved : persistentIps) {
+                    if (saved.startsWith(ipStr.split("/")[0])) {
+                        isManual = true;
+                        break;
+                    }
+                }
+                String label = isManual ? getString(R.string.ipv4_address) : getString(R.string.ipv4_address) + " (DHCP/系统)";
+                newIpList.add(new InfoItem(label, ipStr));
+            }
+
+            RootUtil.CommandResult speedResult = RootUtil.executeRootCommand("cat /sys/class/net/" + foundInterfaceName + "/speed");
+            String speed = "N/A";
+            if (isUp && speedResult.isSuccess() && !speedResult.stdout.trim().isEmpty()) {
+                try {
+                    String speedValue = speedResult.stdout.trim();
+                    if (Integer.parseInt(speedValue) > 0) speed = speedValue + " Mbps";
+                } catch (NumberFormatException e) { /* Ignore */ }
+            }
+
+            RootUtil.CommandResult duplexResult = RootUtil.executeRootCommand("cat /sys/class/net/" + foundInterfaceName + "/duplex");
+            String duplex = "N/A";
+            if (isUp && duplexResult.isSuccess() && !duplexResult.stdout.trim().isEmpty()) {
+                String d = duplexResult.stdout.trim();
+                duplex = d.substring(0, 1).toUpperCase() + d.substring(1);
+            }
+
+            final List<InfoItem> newDetailsList = new ArrayList<>();
+            newDetailsList.add(new InfoItem(getString(R.string.mac_address), macAddress));
+            newDetailsList.add(new InfoItem(getString(R.string.status), isUp ? "UP" : "DOWN"));
+            if (dnsBuilder.length() > 0) {
+                newDetailsList.add(new InfoItem(getString(R.string.dns_servers), dnsBuilder.toString().trim()));
+            }
+            newDetailsList.add(new InfoItem(getString(R.string.speed), speed));
+            newDetailsList.add(new InfoItem(getString(R.string.duplex_mode), duplex));
+
+            // +++ FIX 6: 同时读主表路由，不只读策略表
+            final List<InfoItem> newRouteList = new ArrayList<>();
+            // 主表默认路由
+            RootUtil.CommandResult resultRouteMain = RootUtil.executeRootCommand("ip route show");
+            String[] mainLines = resultRouteMain.stdout.split("\\r?\\n");
+            for (String line : mainLines) {
+                if (line.trim().isEmpty()) continue;
+                if (line.contains("dev " + foundInterfaceName)) {
+                    String cleanedLine = line.trim();
+                    String title = cleanedLine.startsWith("default") ? getString(R.string.default_route_gateway) : getString(R.string.route_to, cleanedLine.split("\\s+")[0]);
+                    InfoItem routeItem = new InfoItem(title, cleanedLine);
+                    routeItem.originalValue = cleanedLine;
+                    newRouteList.add(routeItem);
+                }
+            }
+            // 策略表路由
+            RootUtil.CommandResult resultRouteTable = RootUtil.executeRootCommand("ip route show table " + foundInterfaceName);
+            String[] tableLines = resultRouteTable.stdout.split("\\r?\\n");
+            for (String line : tableLines) {
+                if (line.trim().isEmpty()) continue;
+                String cleanedLine = line.trim();
+                String[] parts = cleanedLine.split("\\s+");
+                String destination = (parts.length > 0) ? parts[0] : "";
+                String title = cleanedLine.startsWith("default") ? getString(R.string.default_route_gateway) + " (策略表)" : getString(R.string.route_to, destination) + " (策略表)";
+                InfoItem routeItem = new InfoItem(title, cleanedLine);
+                routeItem.originalValue = cleanedLine;
+                newRouteList.add(routeItem);
+            }
+
+            final String finalInterfaceName = foundInterfaceName;
+            final boolean finalIsUp = isUp;
+
+            mainHandler.post(() -> {
+                this.currentInterfaceName = finalInterfaceName;
+                this.wasInterfaceUp = finalIsUp;
+                updateUiState(true);
+                tvInterfaceName.setText(finalInterfaceName);
+                updateListView(detailsList, newDetailsList, detailsAdapter, lvInterfaceDetails);
+                updateListView(ipList, newIpList, ipAdapter, lvIpAddresses);
+                updateListView(routeList, newRouteList, routeAdapter, lvRoutes);
+                if (showToast) Toast.makeText(this, getString(R.string.refresh_complete), Toast.LENGTH_SHORT).show();
+            });
+        });
+    }
+
+    private void updateListView(List<InfoItem> currentList, List<InfoItem> newList, InfoAdapter adapter, ListView listView) {
+        if (!currentList.equals(newList)) {
+            currentList.clear();
+            currentList.addAll(newList);
+            adapter.notifyDataSetChanged();
+            listView.post(() -> setListViewHeightBasedOnChildren(listView));
+        }
+    }
+
+    public static void setListViewHeightBasedOnChildren(ListView listView) {
+        ListAdapter listAdapter = listView.getAdapter();
+        if (listAdapter == null) return;
+        int totalHeight = 0;
+        if (listAdapter.getCount() > 0) {
+            int desiredWidth = View.MeasureSpec.makeMeasureSpec(listView.getWidth(), View.MeasureSpec.EXACTLY);
+            for (int i = 0; i < listAdapter.getCount(); i++) {
+                View listItem = listAdapter.getView(i, null, listView);
+                if (listView.getWidth() > 0) {
+                    listItem.measure(desiredWidth, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+                    totalHeight += listItem.getMeasuredHeight();
+                }
+            }
+        }
+        ViewGroup.LayoutParams params = listView.getLayoutParams();
+        params.height = totalHeight + (listView.getDividerHeight() * (listAdapter.getCount() - 1));
+        listView.setLayoutParams(params);
+        listView.requestLayout();
+    }
+
+    private void startAutoRefresh() {
+        if (isAutoRefreshing) return;
+        isAutoRefreshing = true;
+        autoRefreshHandler = new Handler(Looper.getMainLooper());
+        autoRefreshRunnable = new Runnable() {
+            @Override
+            public void run() {
+                // +++ FIX 1: 弹窗期间不刷新
+                if (isDialogShowing) {
+                    autoRefreshHandler.postDelayed(this, 2000);
+                    return;
+                }
+                refreshAllInfo(false);
+                autoRefreshHandler.postDelayed(this, 2000);
+            }
+        };
+        autoRefreshHandler.post(autoRefreshRunnable);
+    }
+
+    private void stopAutoRefresh() {
+        if (autoRefreshHandler != null && autoRefreshRunnable != null) {
+            autoRefreshHandler.removeCallbacks(autoRefreshRunnable);
+        }
+        isAutoRefreshing = false;
+    }
+
+    // +++ FIX 4: 缓存 Root Shell，避免每次新建进程
+    private synchronized boolean ensureRootShell() {
+        if (cachedRootProcess != null && cachedRootProcess.isAlive()) return true;
+        try {
+            cachedRootProcess = Runtime.getRuntime().exec("su");
+            cachedRootWriter = new java.io.BufferedWriter(
+                new java.io.OutputStreamWriter(cachedRootProcess.getOutputStream()));
+            cachedRootReader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(cachedRootProcess.getInputStream()));
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void executeCommandAndRefresh(String command, String successMessage) {
+        stopAutoRefresh();
+        Toast.makeText(this, getString(R.string.executing_action), Toast.LENGTH_SHORT).show();
+        executorService.execute(() -> {
+            // +++ FIX 5: 正确判断命令执行结果
+            RootUtil.CommandResult result = RootUtil.executeRootCommand(command);
+            mainHandler.post(() -> {
+                // +++ FIX 5: 不仅看 stderr，还检查 stdout 里的错误关键词
+                boolean reallySuccess = result.isSuccess() &&
+                    (result.stdout == null || (!result.stdout.contains("Cannot") && !result.stdout.contains("RTNETLINK")));
+                if (reallySuccess) {
+                    Toast.makeText(this, successMessage, Toast.LENGTH_SHORT).show();
+                    refreshAllInfo(false);
+                } else {
+                    String errMsg = result.stderr != null && !result.stderr.isEmpty() ? result.stderr : result.stdout;
+                    Toast.makeText(this, getString(R.string.action_failed, errMsg), Toast.LENGTH_LONG).show();
+                }
+                mainHandler.postDelayed(this::startAutoRefresh, 1000);
+            });
+        });
+    }
+
+    private void applyPersistentConfig(final String interfaceName) {
+        Set<String> ips = sharedPreferences.getStringSet(KEY_PERSISTENT_IPS, new HashSet<>());
+        Set<String> routes = sharedPreferences.getStringSet(KEY_PERSISTENT_ROUTES, new HashSet<>());
+        if (ips.isEmpty() && routes.isEmpty()) return;
+        executorService.execute(() -> {
+            for (String ip : ips) {
+                RootUtil.executeRootCommand("ip addr add " + ip + " dev " + interfaceName);
+            }
+            for (String route : routes) {
+                // 同时写主表和策略表
+                RootUtil.executeRootCommand("ip route add " + route + " dev " + interfaceName);
+                RootUtil.executeRootCommand("ip route add " + route + " dev " + interfaceName + " table " + interfaceName);
+            }
+        });
+    }
+
+    private void saveIpToPrefs(String ipWithPrefix) {
+        Set<String> ips = new HashSet<>(sharedPreferences.getStringSet(KEY_PERSISTENT_IPS, new HashSet<>()));
+        ips.add(ipWithPrefix);
+        sharedPreferences.edit().putStringSet(KEY_PERSISTENT_IPS, ips).apply();
+    }
+
+    private void removeIpFromPrefs(String ipWithPrefix) {
+        Set<String> ips = new HashSet<>(sharedPreferences.getStringSet(KEY_PERSISTENT_IPS, new HashSet<>()));
+        ips.remove(ipWithPrefix);
+        sharedPreferences.edit().putStringSet(KEY_PERSISTENT_IPS, ips).apply();
+    }
+
+    private void saveRouteToPrefs(String routeCommandPart) {
+        Set<String> routes = new HashSet<>(sharedPreferences.getStringSet(KEY_PERSISTENT_ROUTES, new HashSet<>()));
+        routes.add(routeCommandPart);
+        sharedPreferences.edit().putStringSet(KEY_PERSISTENT_ROUTES, routes).apply();
+    }
+
+    private void removeRouteFromPrefs(String fullRouteLine) {
+        Set<String> routes = new HashSet<>(sharedPreferences.getStringSet(KEY_PERSISTENT_ROUTES, new HashSet<>()));
+        String routeToRemove = null;
+        for (String savedRoute : routes) {
+            if (fullRouteLine.trim().contains(savedRoute)) {
+                routeToRemove = savedRoute;
+                break;
+            }
+        }
+        if (routeToRemove != null) {
+            routes.remove(routeToRemove);
+            sharedPreferences.edit().putStringSet(KEY_PERSISTENT_ROUTES, routes).apply();
+        }
+    }
+
+    private void clearAllPrefs() {
+        sharedPreferences.edit().remove(KEY_PERSISTENT_IPS).remove(KEY_PERSISTENT_ROUTES).apply();
+    }
+
+    private void showAboutDialog() {
+        new MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.about_title)
+                .setMessage(R.string.about_message)
+                .setPositiveButton(R.string.ok, null)
+                .show();
+    }
+
+    private void showAddIpDialog() {
+        if (currentInterfaceName.isEmpty()) {
+            Toast.makeText(this, getString(R.string.no_interface_detected), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(this);
+        builder.setTitle(R.string.add_new_ip_title);
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(50, 40, 50, 20);
+        final EditText ipInput = new EditText(this);
+        ipInput.setHint(R.string.ip_address_hint);
+        layout.addView(ipInput);
+        final EditText prefixInput = new EditText(this);
+        prefixInput.setHint(R.string.prefix_length_hint);
+        prefixInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        layout.addView(prefixInput);
+        builder.setView(layout);
+        builder.setPositiveButton(R.string.add, (dialog, which) -> {
+            // +++ FIX 1: 弹窗关闭
+            onDialogDismissed();
+            String ip = ipInput.getText().toString().trim();
+            String prefix = prefixInput.getText().toString().trim();
+            if (!ip.isEmpty() && !prefix.isEmpty()) {
+                String fullIp = ip + "/" + prefix;
+                executeCommandAndRefresh("ip addr add " + fullIp + " dev " + currentInterfaceName, getString(R.string.ip_add_success));
+                saveIpToPrefs(fullIp);
+            }
+        });
+        builder.setNegativeButton(R.string.cancel, (dialog, which) -> { dialog.cancel(); onDialogDismissed(); });
+        builder.show();
+    }
+
+    private void showAddRouteDialog() {
+        if (currentInterfaceName.isEmpty()) {
+            Toast.makeText(this, getString(R.string.no_interface_detected), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(this);
+        builder.setTitle(R.string.add_new_route_title);
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(50, 40, 50, 20);
+        final EditText destInput = new EditText(this);
+        destInput.setHint(R.string.dest_subnet_hint);
+        layout.addView(destInput);
+        final CheckBox defaultCheck = new CheckBox(this);
+        defaultCheck.setText(R.string.set_as_default_gateway);
+        layout.addView(defaultCheck);
+        final EditText gatewayInput = new EditText(this);
+        gatewayInput.setHint(R.string.gateway_hint);
+        layout.addView(gatewayInput);
+        defaultCheck.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            destInput.setEnabled(!isChecked);
+            if (isChecked) destInput.setText("default");
+            else destInput.setText("");
+        });
+        builder.setView(layout);
+        builder.setPositiveButton(R.string.add, (dialog, which) -> {
+            onDialogDismissed();
+            String dest = destInput.getText().toString().trim();
+            String gateway = gatewayInput.getText().toString().trim();
+            if (!dest.isEmpty() && !gateway.isEmpty()) {
+                String routePart = dest + " via " + gateway;
+                // +++ FIX 6: 默认路由同时写主表
+                String command;
+                if (dest.equalsIgnoreCase("default")) {
+                    command = "ip route replace default via " + gateway + " dev " + currentInterfaceName;
+                } else {
+                    command = "ip route add " + routePart + " dev " + currentInterfaceName;
+                }
+                String successMessage = dest.equalsIgnoreCase("default") ? getString(R.string.default_gateway_set_success) : getString(R.string.route_add_success);
+                executeCommandAndRefresh(command, successMessage);
+                saveRouteToPrefs(routePart);
+            }
+        });
+        builder.setNegativeButton(R.string.cancel, (dialog, which) -> { dialog.cancel(); onDialogDismissed(); });
+        builder.show();
+    }
+
+    private void showDeleteConfirmationDialog(String itemType, String item, Runnable onConfirm) {
+        String message = getString(R.string.confirm_delete_message, itemType, item);
+        new MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.confirm_delete_title)
+                .setMessage(message)
+                .setPositiveButton(R.string.delete, (dialog, which) -> {
+                    onConfirm.run();
+                    onDialogDismissed();
+                })
+                .setNegativeButton(R.string.cancel, (dialog, which) -> {
+                    dialog.cancel();
+                    onDialogDismissed();
+                })
+                .show();
+    }
+
+    private void deleteIpAddress(String fullIp) {
+        if (currentInterfaceName.isEmpty()) return;
+        // +++ FIX 2+5: 删除前检查是否是系统地址，执行后正确反馈
+        Set<String> persistentIps = sharedPreferences.getStringSet(KEY_PERSISTENT_IPS, new HashSet<>());
+        boolean isManual = false;
+        for (String saved : persistentIps) {
+            if (saved.equals(fullIp) || saved.startsWith(fullIp.split("/")[0])) {
+                isManual = true;
+                break;
+            }
+        }
+        if (!isManual) {
+            Toast.makeText(this, "系统/DHCP 地址无法直接删除，请先停止 DHCP 或在路由器端操作", Toast.LENGTH_LONG).show();
+            onDialogDismissed();
+            return;
+        }
+        executeCommandAndRefresh("ip addr del " + fullIp + " dev " + currentInterfaceName, getString(R.string.ip_deleted_success));
+        removeIpFromPrefs(fullIp);
+    }
+
+    private void deleteRoute(String fullRoute) {
+        if (currentInterfaceName.isEmpty()) return;
+        // +++ FIX 6: 从主表和策略表都删
+        String command = "ip route del " + fullRoute + " dev " + currentInterfaceName + " table " + currentInterfaceName;
+        String mainCommand = "ip route del " + fullRoute.replace(" table " + currentInterfaceName, "");
+        executeCommandAndRefresh(command, getString(R.string.route_deleted_success));
+        // 也尝试从主表删
+        RootUtil.executeRootCommand(mainCommand);
+        removeRouteFromPrefs(fullRoute);
+    }
+
+    private void resetInterface() {
+        if (currentInterfaceName.isEmpty()) return;
+        new MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.confirm_reset_title)
+                .setMessage(R.string.confirm_reset_message)
+                .setPositiveButton(R.string.reset, (dialog, which) -> {
+                    onDialogDismissed();
+                    // +++ FIX 2: flush 后停 DHCP 再重配
+                    String command = "ip addr flush dev " + currentInterfaceName + " && " +
+                            "ip link set " + currentInterfaceName + " down && " +
+                            "pkill -f dhcpcd 2>/dev/null; " +
+                            "sleep 1 && " +
+                            "ip link set " + currentInterfaceName + " up";
+                    executeCommandAndRefresh(command, getString(R.string.interface_reset_success));
+                    clearAllPrefs();
+                })
+                .setNegativeButton(R.string.cancel, (dialog, which) -> { dialog.cancel(); onDialogDismissed(); })
+                .show();
+    }
+}
